@@ -1,68 +1,108 @@
+use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::Mutex;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-use std::sync::atomic::{AtomicBool, AtomicIsize};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
-lazy_static! {
-    pub static ref MODS_ENABLED: AtomicBool = AtomicBool::new(true);
-    pub static ref CONFIG: Mutex<ModConfig> = Mutex::new(ModConfig::default());
-    pub static ref GAME_UNPACKED: AtomicBool = AtomicBool::new(false);
+use crate::helpers;
+#[cfg(feature = "websockets")]
+use crate::websockets;
+
+pub type GlobalMut<T> = Lazy<Mutex<T>>;
+
+#[cfg(feature = "websockets")]
+pub static MESSAGE_SENDER: OnceCell<tokio::sync::mpsc::Sender<websockets::WebSocketsMessage>> =
+    OnceCell::new();
+
+fn init_config() -> ModConfig {
+    let config_path = PathBuf::from(CONFIG_PATH);
+
+    let default_config = ModConfig::default();
+    let default_config_str = toml::to_string_pretty(&default_config).unwrap();
+
+    if !config_path.is_file() {
+        match File::create(config_path) {
+            Ok(mut f) => f.write_all(default_config_str.as_bytes()).unwrap(),
+            Err(e) => error!("{}", e),
+        };
+
+        ModConfig::default()
+    } else {
+        match File::open(&config_path) {
+            Ok(mut f) => {
+                let mut config = String::new();
+                f.read_to_string(&mut config).unwrap();
+
+                // return loaded config
+                return toml::from_str::<ModConfig>(&config).unwrap_or_else(|e| {
+                    error!("error loading config: {}, writing default...", e);
+                    match File::create(&config_path) {
+                        Ok(mut f) => f.write_all(default_config_str.as_bytes()).unwrap(),
+                        Err(e) => error!("{}", e),
+                    };
+                    default_config
+                });
+            }
+            Err(e) => error!("{}", e),
+        };
+
+        ModConfig::default()
+    }
 }
 
-lazy_static! {
-    pub static ref DIRECTION_P1: AtomicIsize = AtomicIsize::new(0);
-    pub static ref DIRECTION_P2: AtomicIsize = AtomicIsize::new(0);
-}
+pub static CONFIG: GlobalMut<ModConfig> = Lazy::new(|| Mutex::new(init_config()));
 
-lazy_static! {
-    pub static ref X_POSITION_P1: AtomicIsize = AtomicIsize::new(0);
-    pub static ref X_POSITION_P2: AtomicIsize = AtomicIsize::new(0);
-}
+pub static MOD_SUBFOLDERS: GlobalMut<Vec<Option<PathBuf>>> = Lazy::new(|| {
+    let mut paths: Vec<Option<PathBuf>> = helpers::get_subfolder_names(DEFAULT_MODS_FOLDER)
+        .unwrap_or_default()
+        .into_iter()
+        .map(Some)
+        .collect();
 
-lazy_static! {
-    pub static ref Y_POSITION_P1: AtomicIsize = AtomicIsize::new(0);
-    pub static ref Y_POSITION_P2: AtomicIsize = AtomicIsize::new(0);
-}
+    paths.insert(0, None);
 
-lazy_static! {
-    pub static ref X_VELOCITY_P1: AtomicIsize = AtomicIsize::new(0);
-    pub static ref X_VELOCITY_P2: AtomicIsize = AtomicIsize::new(0);
-}
+    Mutex::new(paths)
+});
 
-lazy_static! {
-    pub static ref Y_VELOCITY_P1: AtomicIsize = AtomicIsize::new(0);
-    pub static ref Y_VELOCITY_P2: AtomicIsize = AtomicIsize::new(0);
-}
-
-lazy_static! {
-    pub static ref HEALTH_P1: AtomicIsize = AtomicIsize::new(0);
-    pub static ref HEALTH_P2: AtomicIsize = AtomicIsize::new(0);
-}
-
-lazy_static! {
-    pub static ref TENSION_PULSE_P1: AtomicIsize = AtomicIsize::new(0);
-    pub static ref TENSION_PULSE_P2: AtomicIsize = AtomicIsize::new(0);
-}
+pub static SELECTED_MOD_FOLDER: GlobalMut<PathBuf> =
+    Lazy::new(|| Mutex::new(DEFAULT_MODS_FOLDER.into()));
 
 /// The folder where all .bbscript files are held
-pub const MODS_FOLDER: &str = r"..\..\Mods";
+pub const DEFAULT_MODS_FOLDER: &str = r"..\..\Mods\";
+pub const DUMPED_SCRIPTS_FOLDER: &str = r"..\..\Dumped Scripts\";
 pub const CONFIG_PATH: &str = r".\rev2mod_config.toml";
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ModConfig {
     pub mods_enabled: bool,
-    pub hot_reloading: bool,
     pub display_ui_on_start: bool,
+    pub dump_scripts: bool,
     pub log_level: log::LevelFilter,
+    pub skip_intro_movies: bool,
+    pub online_input_delay: u32,
+    pub display_battle_hud: bool,
+
+    #[cfg(feature = "websockets")]
+    pub websockets: websockets::WebSocketsConfig,
 }
 
 impl Default for ModConfig {
     fn default() -> Self {
         Self {
             mods_enabled: true,
-            hot_reloading: true,
             display_ui_on_start: true,
-            log_level: log::LevelFilter::Info
+            dump_scripts: false,
+            log_level: log::LevelFilter::Info,
+            skip_intro_movies: true,
+            online_input_delay: 1,
+            display_battle_hud: true,
+
+            #[cfg(feature = "websockets")]
+            websockets: websockets::WebSocketsConfig::default(),
         }
     }
 }

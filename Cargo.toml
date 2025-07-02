@@ -7,21 +7,27 @@ edition = "2021"
 
 [lib]
 name = "rev2hook"
-path = "src/lib.rs" 
-crate_type = ["cdylib"]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
 
 [features]
-save-state = []
-
-# default = ["save-state"]
+websockets = ["tokio", "serde_json", "tokio-tungstenite"]
+default = ["websockets"]
 
 [dependencies]
-imgui-impl-win32-rs = { git = "https://github.com/super-continent/imgui-impl-win32-rs" }
-imgui-dx9-renderer = "0"
-winapi = { version = "0", features = ["minwindef", "consoleapi", "libloaderapi", "d3d9", "d3d9types", "ntdef", "psapi"] }
-imgui = "0.8"
-detour = { git = "https://github.com/darfink/detour-rs"}
-lazy_static = "1"
+sigscan = { git = "https://github.com/super-continent/sigscan" }
+winapi = { version = "0", features = [
+    "minwindef",
+    "consoleapi",
+    "libloaderapi",
+    "d3d9",
+    "d3d9types",
+    "ntdef",
+    "psapi",
+    "winuser",
+    "processthreadsapi",
+] }
+retour = { version = "0.3", features = ["static-detour", "thiscall-abi"] }
 parking_lot = "0"
 log = { version = "0", features = ["serde"] }
 simplelog = "0"
@@ -29,3 +35,17 @@ thiserror = "1"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.5"
 dashmap = "5.3"
+once_cell = { version = "1.13", features = ["parking_lot"] }
+region = "3.0.0"
+serde_json = { version = "1.0.120", optional = true }
+tokio = { version = "1.39.1", features = [
+    "rt",
+    "sync",
+    "macros",
+    "time",
+], optional = true }
+tokio-tungstenite = { version = "0.24.0", optional = true }
+steamworks-sys = "0.11.0"
+futures-util = "0.3.31"
+hudhook = "0.8"
+concat-idents = "1.1.5"

@@ -1,32 +1,30 @@
-#![feature(once_cell, abi_thiscall)]
-
 mod error;
 mod game;
 mod global;
 mod helpers;
+mod steam;
 mod ui;
+#[cfg(feature = "websockets")]
+mod websockets;
 
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 
-use std::io::{Read, Write};
 use std::mem;
 use std::os::windows::ffi::OsStringExt;
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
 extern crate log;
 
+use hudhook::windows::Win32::Foundation::{BOOL, HINSTANCE, MAX_PATH, TRUE};
+use once_cell::sync::OnceCell;
 use simplelog::*;
+use winapi::shared::minwindef::{DWORD, HINSTANCE__, LPVOID};
 use winapi::{
     ctypes::c_void,
     shared::guiddef::REFIID,
-    shared::minwindef::*,
     shared::ntdef::HRESULT,
     shared::winerror,
     um::libloaderapi,
@@ -36,55 +34,41 @@ use winapi::{
 
 #[no_mangle]
 #[allow(non_snake_case)]
-pub extern "stdcall" fn DllMain(hinst_dll: HINSTANCE, attach_reason: DWORD, _: c_void) -> BOOL {
-    unsafe {
-        libloaderapi::DisableThreadLibraryCalls(hinst_dll);
-    }
+pub unsafe extern "stdcall" fn DllMain(
+    hinst_dll: HINSTANCE,
+    attach_reason: u32,
+    _: *mut (),
+) -> BOOL {
+    if attach_reason == DLL_PROCESS_ATTACH {
+        // if websockets are enabled we set up the message passing state
+        #[cfg(feature = "websockets")]
+        {
+            // channel has a buffer of 10, theoretically 5(?) events could  occur on the same frame at most
+            // which means this gives us ~10 frames of buffer in the worst case
+            let (tx, rx) = tokio::sync::mpsc::channel(50);
+            global::MESSAGE_SENDER.get_or_init(move || tx);
+            thread::spawn(move || unsafe { initialize(hinst_dll) });
 
-    match attach_reason {
-        DLL_PROCESS_ATTACH => {
-            thread::spawn(|| unsafe { initialize() });
+            thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    websockets::start_websocket_server(rx).await;
+                });
+            });
         }
-        _ => {}
+        #[cfg(not(feature = "websockets"))]
+        {
+            thread::spawn(|| unsafe { initialize(hinst_dll) });
+        }
     };
 
-    return TRUE;
+    TRUE
 }
 
-unsafe fn initialize() {
-    let config_path = PathBuf::from(global::CONFIG_PATH);
-
-    let default_config = global::ModConfig::default();
-    let default_config_str = toml::to_string_pretty(&default_config).unwrap();
-
-    if !config_path.is_file() {
-        match File::create(config_path) {
-            Ok(mut f) => f.write_all(default_config_str.as_bytes()).unwrap(),
-            Err(e) => error!("{}", e),
-        };
-    } else {
-        match File::open(&config_path) {
-            Ok(mut f) => {
-                let mut config = String::new();
-                f.read_to_string(&mut config).unwrap();
-
-                let new_config = toml::from_str::<global::ModConfig>(&config)
-                    .unwrap_or_else(|e| {
-                        error!("error loading config: {}, writing default...", e);
-                        match File::create(&config_path) {
-                            Ok(mut f) => f.write_all(default_config_str.as_bytes()).unwrap(),
-                            Err(e) => error!("{}", e),
-                        };
-                        default_config
-                    });
-
-                let mut config_lock = global::CONFIG.lock();
-                *config_lock = new_config;
-            }
-            Err(e) => error!("{}", e),
-        };
-    }
-
+unsafe fn initialize(module: HINSTANCE) {
     let log_level = global::CONFIG.lock().log_level;
     // let log_level = LevelFilter::Trace;
     if let Ok(logfile) = File::create("rev2mod.log") {
@@ -104,24 +88,35 @@ unsafe fn initialize() {
 
     info!("Initializing");
 
-    info!(
+    std::panic::set_hook(Box::new(|panic_info| {
+        error!("PANIC: {}", panic_info.to_string())
+    }));
+
+    const REDENGINE_INI_PATH: &str = "../../REDGame/Config/REDEngine.ini";
+
+    if let Ok(ini) = fs::read_to_string(REDENGINE_INI_PATH) {
+        let new_ini = if global::CONFIG.lock().skip_intro_movies {
+            ini.replace("bForceNoMovies=FALSE", "bForceNoMovies=TRUE")
+        } else {
+            ini.replace("bForceNoMovies=TRUE", "bForceNoMovies=FALSE")
+        };
+
+        let res = fs::write(REDENGINE_INI_PATH, new_ini);
+        debug!("Writing REDEngine.ini: {:?}", res);
+    }
+
+    debug!(
         "Mods folder created: {}",
-        fs::create_dir(global::MODS_FOLDER).is_ok()
+        fs::create_dir(global::DEFAULT_MODS_FOLDER).is_ok()
     );
 
     debug!("UI hooks initializing...");
 
-    let mut ui_result = ui::ui_hooks::init_ui();
-    while let Err(e) = ui_result {
-        error!("Initializing UI failed: {}", e);
-        thread::sleep(std::time::Duration::from_secs(5));
-        ui_result = ui::ui_hooks::init_ui();
-    }
-    info!("UI hook success!");
-
-    debug!("Waiting for Endscene call to hook game");
-    while !global::GAME_UNPACKED.load(Ordering::SeqCst) {
-        thread::sleep(std::time::Duration::from_millis(10));
+    let ui_result = ui::ui_hooks::init_ui(module);
+    if let Err(e) = ui_result {
+        info!("Failed to hook UI: {:?}", e);
+    } else {
+        info!("UI hook success!");
     }
 
     info!("Initializing game hooks...");
@@ -135,9 +130,7 @@ type DInput8Create =
 
 const SYSTEM32_DEFAULT: &str = r"C:\Windows\System32";
 
-lazy_static! {
-    static ref REAL_DINPUT8_HANDLE: AtomicU32 = AtomicU32::new(0);
-}
+static REAL_DINPUT8_HANDLE: OnceCell<u32> = OnceCell::new();
 
 // Used by GuiltyGearXrd.exe, lets you rename the DLL to dinput8.dll and have it load on startup
 #[no_mangle]
@@ -151,35 +144,9 @@ pub unsafe extern "stdcall" fn DirectInput8Create(
     debug!("DirectInput8Create called");
 
     // Load real dinput8.dll if not already loaded
-    if REAL_DINPUT8_HANDLE.load(Ordering::SeqCst) == 0 {
-        let mut buffer = [0u16; MAX_PATH];
-        let written_wchars = GetSystemDirectoryW(buffer.as_mut_ptr(), MAX_PATH as u32);
 
-        let system_directory = if written_wchars == 0 {
-            SYSTEM32_DEFAULT.into()
-        } else {
-            let str_with_nulls = OsString::from_wide(&buffer)
-                .into_string()
-                .unwrap_or(SYSTEM32_DEFAULT.into());
-            str_with_nulls.trim_matches('\0').to_string()
-        };
+    let real_dinput8 = *REAL_DINPUT8_HANDLE.get_or_init(|| get_dinput8_handle()) as *mut HINSTANCE__;
 
-        let dinput_path = system_directory + r"\dinput8.dll";
-        debug!("Got real dinput8.dll path: `{}`", dinput_path);
-
-        let real_dinput_handle =
-            libloaderapi::LoadLibraryW(helpers::win32_wstring(&dinput_path).as_mut_ptr());
-
-        if !real_dinput_handle.is_null() {
-            debug!(
-                "Storing pointer to real DInput8: `{:#X}`",
-                real_dinput_handle as u32
-            );
-            REAL_DINPUT8_HANDLE.store(real_dinput_handle as u32, Ordering::SeqCst);
-        }
-    }
-
-    let real_dinput8 = REAL_DINPUT8_HANDLE.load(Ordering::SeqCst) as HINSTANCE;
     let dinput8create_fn_name =
         CString::new("DirectInput8Create").expect("CString::new(`DirectInput8Create`) failed");
 
@@ -191,4 +158,30 @@ pub unsafe extern "stdcall" fn DirectInput8Create(
     }
 
     winerror::E_FAIL // Unspecified failure
+}
+
+unsafe fn get_dinput8_handle() -> u32 {
+    let mut buffer = [0u16; MAX_PATH as usize];
+    let written_wchars = GetSystemDirectoryW(buffer.as_mut_ptr(), MAX_PATH as u32);
+
+    let system_directory = if written_wchars == 0 {
+        SYSTEM32_DEFAULT.into()
+    } else {
+        let str_with_nulls = OsString::from_wide(&buffer)
+            .into_string()
+            .unwrap_or(SYSTEM32_DEFAULT.into());
+        str_with_nulls.trim_matches('\0').to_string()
+    };
+
+    let dinput_path = system_directory + r"\dinput8.dll";
+    debug!("Got real dinput8.dll path: `{}`", dinput_path);
+
+    let real_dinput_handle =
+        libloaderapi::LoadLibraryW(helpers::win32_wstring(&dinput_path).as_mut_ptr());
+
+    debug!(
+        "Storing pointer to real DInput8: `{:#X}`",
+        real_dinput_handle as u32
+    );
+    real_dinput_handle as u32
 }

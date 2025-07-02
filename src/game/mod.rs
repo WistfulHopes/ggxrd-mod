@@ -1,9 +1,11 @@
 pub mod hooks;
-pub mod offset;
 pub mod internal;
+pub mod offset;
 
+use std::fs::File;
 use std::io::prelude::*;
-use std::{fs::File, path::PathBuf};
+
+use crate::global;
 
 // full list of character shortnames used in scripts
 mod names {
@@ -97,28 +99,30 @@ impl ScriptFile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ScriptType {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptType {
     Main,
     Effect,
 }
 
-fn get_script_file(script_file: ScriptFile, file_type: ScriptType) -> Option<Vec<u8>> {
-    let mut mods_path = PathBuf::from(crate::global::MODS_FOLDER);
-
-    let mut script = Vec::new();
-
-    let file_name = match file_type {
+pub fn get_script_filename(script_file: ScriptFile, script_type: ScriptType) -> String {
+    match script_type {
         ScriptType::Main => format!("{}.bbscript", script_file.short_name()),
         ScriptType::Effect => format!("{}_ef.bbscript", script_file.short_name()),
-    };
+    }
+}
 
-    mods_path.push(file_name);
+fn get_script_file(script_file: ScriptFile, file_type: ScriptType) -> Option<Vec<u8>> {
+    let mods_path = global::SELECTED_MOD_FOLDER.lock();
 
-    let result = File::open(&mods_path).and_then(|mut file| file.read_to_end(&mut script));
+    let file_name = get_script_filename(script_file, file_type);
+    let script_path = mods_path.join(file_name);
+
+    let mut script = Vec::new();
+    let result = File::open(&script_path).and_then(|mut file| file.read_to_end(&mut script));
 
     if result.is_ok() {
-        debug!("Got script `{}`", mods_path.display());
+        debug!("Got script `{}`", script_path.display());
         Some(script)
     } else {
         None

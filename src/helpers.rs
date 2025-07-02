@@ -1,8 +1,9 @@
 use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::{ffi::OsStr, mem};
 
-use winapi::um::memoryapi::ReadProcessMemory;
-use winapi::um::psapi::GetModuleInformation;
+use sigscan::SigScan;
+use winapi::um::psapi::{GetModuleInformation, MODULEINFO};
 use winapi::{
     ctypes::c_int,
     shared::{minwindef::*, windef::HWND},
@@ -23,9 +24,37 @@ macro_rules! make_fn {
     };
 }
 
+/// Follow some chain of offsets from a pointer to get a pointer to data.
+/// `[0x0, 0x10, 0x8]` will offset by `0x0`, dereference, offset by `0x10`, dereference,
+/// then offset by `0x8`, dereference, and return the resulting pointer.
+pub unsafe fn pointer_chain(mut ptr: *mut u8, offsets: impl AsRef<[isize]>) -> *mut u8 {
+    for offset in offsets.as_ref() {
+        // offset ptr and then deref
+        ptr = *(ptr.offset(*offset) as *mut *mut u8);
+    }
+
+    ptr
+}
+
 pub unsafe fn read_type<T: Sized>(ptr: *mut u8) -> T {
     let ptr = ptr as *mut T;
     ptr.read()
+}
+
+pub unsafe fn write_type<T: Sized>(ptr: *mut T, val: T) {
+    let _guard = match region::protect_with_handle(
+        ptr,
+        size_of::<T>(),
+        region::Protection::READ_WRITE_EXECUTE,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            log::error!("error protecting memory: {}", e);
+            return;
+        }
+    };
+
+    ptr.write(val);
 }
 
 pub unsafe fn set_window_long_ptr(hwnd: HWND, index: c_int, new_long: i32) -> i32 {
@@ -36,14 +65,45 @@ pub unsafe fn set_window_long_ptr(hwnd: HWND, index: c_int, new_long: i32) -> i3
 }
 
 pub unsafe fn get_window_long(hwnd: HWND, n_index: INT) -> LONG {
-    return match IsWindowUnicode(hwnd) {
+    match IsWindowUnicode(hwnd) {
         0 => GetWindowLongA(hwnd, n_index),
         _ => GetWindowLongW(hwnd, n_index),
-    };
+    }
 }
 
 pub unsafe fn get_module_base() -> HINSTANCE {
     winapi::um::libloaderapi::GetModuleHandleA(std::ptr::null_mut())
+}
+
+pub unsafe fn get_aob_offset(pattern: &SigScan) -> Option<usize> {
+    let base = get_module_base();
+    let mut module_info = mem::zeroed::<MODULEINFO>();
+
+    GetModuleInformation(
+        GetCurrentProcess(),
+        base,
+        &mut module_info,
+        mem::size_of::<MODULEINFO>() as u32,
+    );
+    let module_size = module_info.SizeOfImage;
+
+    let _guard = match region::protect_with_handle(
+        base,
+        module_size as usize,
+        region::Protection::READ_WRITE_EXECUTE,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            log::error!("error protecting memory: {}", e);
+            return None;
+        }
+    };
+
+    let scan_region = std::slice::from_raw_parts(base as *mut u8, module_size as usize);
+
+    pattern
+        .scan(scan_region)
+        .map(|offset| offset + base as usize)
 }
 
 pub unsafe fn call_wndproc(
@@ -67,123 +127,66 @@ pub fn win32_wstring(val: &str) -> Vec<u16> {
         .collect::<Vec<u16>>()
 }
 
-/// Create an [`Address`] that scans for a specified pattern.
-#[macro_export]
-macro_rules! pattern {
-    ( $( $x:tt ),* ) => {
-        crate::helpers::AobSignature::new(
-            &[ $( pattern!(@ONE_ELEMENT $x), )* ]
-        )
-    };
-    (@ONE_ELEMENT $x:literal) => { Some($x) };
-    (@ONE_ELEMENT _) => { None };
-}
-
-/// Type for storing offsets and AOB scans
-/// for finding the offset of something within a running program
-pub struct Offset(u32);
+/// Type for storing offsets to memory
+pub struct Offset(usize);
 
 impl Offset {
     /// Create an [`Offset`] that calculates the offset of a programs base address
-    pub const fn new(offset: u32) -> Self {
+    pub const fn new(offset: usize) -> Self {
         Self(offset)
     }
 
-    pub unsafe fn get_address(&self) -> u32 {
-        let base = get_module_base() as u32;
+    pub unsafe fn get_address(&self) -> usize {
+        let base = get_module_base() as usize;
         base + self.0
     }
 }
 
-pub struct AobSignature<'a>(&'a [Option<u8>]);
+pub fn get_subfolder_names(path: impl AsRef<Path>) -> std::io::Result<Vec<PathBuf>> {
+    let iter = std::fs::read_dir(path.as_ref())?;
 
-impl<'a> AobSignature<'a> {
-    pub const fn new(signature: &'a [Option<u8>]) -> Self {
-        Self(signature)
-    }
+    // filter by DirEntries which exist and are directories
+    // then map to PathBufs containing only the directory name
+    let paths = iter
+        .filter_map(|dir_entry| {
+            dir_entry.ok().filter(|p| p.path().is_dir()).map(|entry| {
+                let path = entry.path();
+                let name = path.file_name().expect("should have a file name");
 
-    pub unsafe fn find_in_base_module(&self) -> Option<u32> {
-        use winapi::um::psapi::MODULEINFO;
-
-        let process = GetCurrentProcess();
-        let module = get_module_base();
-
-        let mut module_info = mem::zeroed::<MODULEINFO>();
-
-        if GetModuleInformation(
-            process,
-            module,
-            &mut module_info,
-            mem::size_of::<MODULEINFO>() as u32,
-        ) == 0
-        {
-            return None;
-        };
-
-        let mut buffer = vec![0u8; module_info.SizeOfImage as usize];
-        let mut bytes_read = 0;
-
-        if ReadProcessMemory(
-            process,
-            module_info.lpBaseOfDll,
-            buffer.as_mut_ptr() as *mut _,
-            module_info.SizeOfImage as usize,
-            &mut bytes_read,
-        ) == 0
-        {
-            return None;
-        }
-        debug!("bytes read: {}", bytes_read);
-        debug!(
-            "Scanning AOB, address = {:X}, size = {:X}",
-            module as u32, module_info.SizeOfImage
-        );
-
-        debug!("patlen = {}, bufferlen = {}", self.0.len(), buffer.len());
-        if let Some(offset) = scan_aob(&buffer, self.0) {
-            Some(module as u32 + offset as u32)
-        } else {
-            None
-        }
-    }
+                PathBuf::from(name)
+            })
+        })
+        .collect();
+    Ok(paths)
 }
 
-// Boyer-Moore-Horspool substring search
-// Code taken and modified from hudhook (https://github.com/veeenu/hudhook)
-pub fn scan_aob(haystack: &[u8], needle: &[Option<u8>]) -> Option<usize> {
-    let (pattern_len, haystack_len) = (needle.len(), haystack.len());
+macro_rules! offset_struct {
+    ($(struct $type_name:ident {
+        $($field_name:ident @ $offset:literal: $field_type:ty),* $(,)?
+    })+)  => {
+        $(
+            #[repr(transparent)]
+            pub struct $type_name(pub *mut u8);
 
-    if pattern_len > haystack_len {
-        debug!("pattern length greater than haystack length!");
-        panic!("pattern length must be less than haystack length")
-    }
+            impl $type_name {
+                $(
+                    pub unsafe fn $field_name(&self) -> $field_type {
+                        let ptr = self.0.offset($offset) as *mut $field_type;
+                        ptr.read_unaligned()
+                    }
+                )*
 
-    let mut skips = [pattern_len; 256];
-    for pattern_idx in 0..pattern_len - 1 {
-        if let Some(v) = needle[pattern_idx] {
-            skips[v as usize] = pattern_len - pattern_idx - 1;
-        }
-    }
-
-    let mut haystack_idx = pattern_len - 1;
-    while haystack_idx < haystack_len {
-        let mut hay_idx = haystack_idx;
-        for pat_idx in (0..pattern_len).rev() {
-            if !(needle[pat_idx as usize].is_none()
-                || needle[pat_idx as usize] == Some(haystack[hay_idx as usize]))
-            {
-                break;
+                $(
+                    concat_idents::concat_idents!(fn_name = set_, $field_name {
+                        pub unsafe fn fn_name(&mut self, value: $field_type) {
+                            let ptr = self.0.offset($offset) as *mut $field_type;
+                            ptr.write_unaligned(value);
+                        }
+                    });
+                )*
             }
-
-            if pat_idx == 0 {
-                return Some(hay_idx);
-            }
-
-            hay_idx -= 1;
-        }
-
-        haystack_idx += skips[haystack[haystack_idx] as usize];
-    }
-
-    None
+        )+
+    };
 }
+
+pub(crate) use offset_struct;
