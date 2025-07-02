@@ -65,7 +65,7 @@ pub fn ui_loop(ui: &mut Ui) {
                     let mut startup_ui = config.display_ui_on_start;
                     let mut dump_scripts = config.dump_scripts;
                     let mut selected_path = SELECTED_FOLDER.load(Ordering::SeqCst);
-                    let mut selected_scene = SELECTED_FOLDER.load(Ordering::SeqCst);
+                    let mut selected_scene = SELECTED_SCENE.load(Ordering::SeqCst);
                     let mut display_battle_hud = config.display_battle_hud;
 
                     if ui.checkbox("Script mods enabled", &mut mods_on) {
