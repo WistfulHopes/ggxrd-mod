@@ -1,3 +1,5 @@
+#![feature(sized_hierarchy)]
+
 mod error;
 mod game;
 mod global;
@@ -6,6 +8,7 @@ mod steam;
 mod ui;
 #[cfg(feature = "websockets")]
 mod websockets;
+mod sdk;
 
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
@@ -109,6 +112,12 @@ unsafe fn initialize(module: HINSTANCE) {
         "Mods folder created: {}",
         fs::create_dir(global::DEFAULT_MODS_FOLDER).is_ok()
     );
+
+    debug!("Initializing UE3 SDK...");
+    let sdk_result = sdk::sdk::ffi::find_globals();
+    if !sdk_result {
+        info!("Failed to find UE3 global variables! Some functionality will be disabled.");
+    }
 
     debug!("UI hooks initializing...");
 
