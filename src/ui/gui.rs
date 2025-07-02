@@ -2,6 +2,7 @@ use crate::game::offset::GameState;
 use crate::game::offset::GAMESTATE_PTR;
 use crate::game::offset::ROLLBACK_MANAGER;
 use crate::global;
+use crate::sdk::sdk::ffi::change_scene;
 #[cfg(feature = "websockets")]
 use crate::websockets;
 
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 static DISPLAY_UI: Lazy<AtomicBool> =
     Lazy::new(|| AtomicBool::new(global::CONFIG.lock().display_ui_on_start));
 static SELECTED_FOLDER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+static SELECTED_SCENE: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 
 fn save_config(config: global::ModConfig) {
     std::fs::File::create(global::CONFIG_PATH)
@@ -63,6 +65,7 @@ pub fn ui_loop(ui: &mut Ui) {
                     let mut startup_ui = config.display_ui_on_start;
                     let mut dump_scripts = config.dump_scripts;
                     let mut selected_path = SELECTED_FOLDER.load(Ordering::SeqCst);
+                    let mut selected_scene = SELECTED_FOLDER.load(Ordering::SeqCst);
                     let mut display_battle_hud = config.display_battle_hud;
 
                     if ui.checkbox("Script mods enabled", &mut mods_on) {
@@ -111,6 +114,51 @@ pub fn ui_loop(ui: &mut Ui) {
 
                     if ui.checkbox("Display battle HUD", &mut display_battle_hud) {
                         config.display_battle_hud = display_battle_hud
+                    }
+
+                    let scene_ids = [
+                        "DEBUGMENU",
+                        "DEBUG_CHARA_SELECT",
+                        "BATTLE",
+                        "TITLE",
+                        "CHARA_SELECT",
+                        "CHARA_INTRO",
+                        "STAGE_INTRO",
+                        "CONTINUE",
+                        "GAMEOVER",
+                        "TESTMODE",
+                        "BRIEFING",
+                        "INTERLUDE_DRAMA",
+                        "RANKING",
+                        "NEWS",
+                        "BATTLE_DIRECT",
+                        "ENDING",
+                        "OPENING_DRAMA",
+                        "NETWORK_MENU",
+                        "STORY_TOP",
+                        "STORY_MAIN",
+                        "DEBUGMAINMENU",
+                        "MAINMENU",
+                        "GALLERY",
+                        "LIBRARY",
+                        "REPLAY_MENU",
+                        "LOBBY",
+                        "FISHING",
+                        "ROOM",
+                        "DIGITALFIGURE",
+                        "STORY_STAFFROLL",
+                        "INTERLUDE_TO_BATTLE",
+                    ];
+
+                    if ui.combo_simple_string("Selected Scene", &mut selected_scene, &scene_ids)
+                    {
+                        SELECTED_SCENE.store(selected_scene, Ordering::SeqCst);
+
+                        config.scene_id = selected_scene as i32
+                    }
+
+                    if ui.button("Change Scene") {
+                        change_scene(config.scene_id);
                     }
 
                     unsafe {

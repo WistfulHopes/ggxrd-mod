@@ -85,6 +85,7 @@ pub struct ModConfig {
     pub skip_intro_movies: bool,
     pub online_input_delay: u32,
     pub display_battle_hud: bool,
+    pub scene_id: i32,
 
     #[cfg(feature = "websockets")]
     pub websockets: websockets::WebSocketsConfig,
@@ -100,6 +101,7 @@ impl Default for ModConfig {
             skip_intro_movies: true,
             online_input_delay: 1,
             display_battle_hud: true,
+            scene_id: 0,
 
             #[cfg(feature = "websockets")]
             websockets: websockets::WebSocketsConfig::default(),

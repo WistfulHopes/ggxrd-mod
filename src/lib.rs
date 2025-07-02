@@ -35,6 +35,8 @@ use winapi::{
     um::{unknwnbase::LPUNKNOWN, winnt::DLL_PROCESS_ATTACH},
 };
 
+use crate::sdk::sdk::ffi::find_globals;
+
 #[no_mangle]
 #[allow(non_snake_case)]
 pub unsafe extern "stdcall" fn DllMain(
@@ -114,7 +116,7 @@ unsafe fn initialize(module: HINSTANCE) {
     );
 
     debug!("Initializing UE3 SDK...");
-    let sdk_result = sdk::sdk::ffi::find_globals();
+    let sdk_result = find_globals();
     if !sdk_result {
         info!("Failed to find UE3 global variables! Some functionality will be disabled.");
     }
